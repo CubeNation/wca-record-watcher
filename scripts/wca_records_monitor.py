@@ -27,7 +27,8 @@ API_URL = "https://live.worldcubeassociation.org/api"
 STATE_PATH = Path(__file__).resolve().parent.parent / "state" / "seen.json"
 WATCH_COUNTRY = os.environ.get("WATCH_COUNTRY", "BD").upper()
 RETENTION_DAYS = 30
-EMBEDS_PER_MESSAGE = 10
+# Discord rejects API requests without a User-Agent with a bare 403.
+USER_AGENT = "wca-record-watcher (+https://github.com/CubeNation/wca-record-watcher)"
 
 # recentRecords accepts no arguments, so every filter below is applied locally.
 QUERY = """
@@ -141,7 +142,7 @@ def fetch_records(attempts=3):
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "wca-record-watcher (github actions)",
+                "User-Agent": USER_AGENT,
             },
         )
         try:
@@ -191,9 +192,20 @@ def build_embed(record):
     if person.get("wcaId"):
         who = f"[{person['name']}](https://www.worldcubeassociation.org/persons/{person['wcaId']})"
 
+    # The URL must be unique per embed. Discord's client silently collapses
+    # embeds that share an identical url, so linking every record to its
+    # competition page made five of six records vanish from the channel. The
+    # round link is also a better destination, and the fragment keeps a
+    # single and an average from the same round distinct.
+    round_id = result["round"]["id"]
+    url = (
+        f"https://live.worldcubeassociation.org/competitions/{competition['id']}"
+        f"/rounds/{round_id}#{record['id']}"
+    )
+
     return {
         "title": f"{flag} New {heading}",
-        "url": f"https://live.worldcubeassociation.org/competitions/{competition['id']}",
+        "url": url,
         "description": f"**{who}** ({person['country']['name']}) set a new {record['tag']} in {event['name']}.",
         "color": 0xF1C40F if is_wr else 0x006A4E,
         "fields": [
@@ -211,11 +223,16 @@ def build_embed(record):
 
 
 def post_to_discord(webhook_url, embeds, role_id):
-    """Discord accepts 10 embeds per message, so send in batches."""
-    for start in range(0, len(embeds), EMBEDS_PER_MESSAGE):
-        batch = embeds[start:start + EMBEDS_PER_MESSAGE]
-        payload = {"embeds": batch}
-        if role_id and start == 0:
+    """One message per record.
+
+    Batching several embeds into one message is tempting, but it gives a single
+    notification for a whole batch, and Discord's client collapses embeds that
+    share a url. One message per record avoids both, at the cost of a ping per
+    record - acceptable for something this rare.
+    """
+    for index, embed in enumerate(embeds):
+        payload = {"embeds": [embed]}
+        if role_id:
             payload["content"] = f"<@&{role_id}>"
             payload["allowed_mentions"] = {"roles": [role_id]}
 
@@ -226,12 +243,15 @@ def post_to_discord(webhook_url, embeds, role_id):
                 data=body,
                 headers={
                     "Content-Type": "application/json",
-                    "User-Agent": "wca-record-watcher",
+                    "User-Agent": USER_AGENT,
                 },
             )
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
-                    print(f"Posted {len(batch)} record(s) to Discord (HTTP {response.status}).")
+                    print(
+                        f"Posted {index + 1}/{len(embeds)} to Discord "
+                        f"(HTTP {response.status}): {embed['fields'][1]['value']}"
+                    )
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code == 429 and attempt < 3:
