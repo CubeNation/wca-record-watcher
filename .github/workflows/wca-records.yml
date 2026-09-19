@@ -1,0 +1,64 @@
+name: WCA record watcher
+
+on:
+  schedule:
+    # Every 15 minutes. See README for the billing trade-off on private repos.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      reprime:
+        description: "Reset state and mark everything seen without notifying"
+        type: boolean
+        default: false
+
+# The job commits state/seen.json back to the repo.
+permissions:
+  contents: write
+
+# Two overlapping runs would race on the state commit.
+concurrency:
+  group: wca-record-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check WCA Live for new records
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_ROLE_ID: ${{ vars.DISCORD_ROLE_ID }}
+          WATCH_COUNTRY: ${{ vars.WATCH_COUNTRY || 'BD' }}
+          REPRIME: ${{ inputs.reprime }}
+        run: python scripts/wca_records_monitor.py
+
+      - name: Persist state
+        run: |
+          set -euo pipefail
+          # --porcelain, not `git diff`: on the very first run state/seen.json
+          # is untracked, and git diff does not see untracked files.
+          if [ -z "$(git status --porcelain -- state/seen.json)" ]; then
+            echo "State unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/seen.json
+          git commit -m "chore: update WCA record watcher state [skip ci]"
+          # Another run may have pushed while this one was working.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push failed, rebasing and retrying ($attempt/3)."
+            git pull --rebase --autostash
+            sleep 5
+          done
+          echo "Could not push state after 3 attempts." >&2
+          exit 1
